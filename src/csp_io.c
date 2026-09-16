@@ -132,7 +132,10 @@ void csp_send_direct(csp_id_t* idout, csp_packet_t * packet, csp_iface_t * route
 
 	/* Quickly send on loopback */
 	if (idout->dst == csp_if_lo.addr) {
-		csp_send_direct_iface(idout, packet, &csp_if_lo, via, from_me);
+		csp_id_t idout_lo = *idout;
+
+		/* Same source address handling as every other interface */
+		send_packet(&idout_lo, packet, &csp_if_lo, via, from_me);
 		return;
 	}
 
