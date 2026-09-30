@@ -28,6 +28,8 @@ typedef struct {
 	struct k_thread rx_thread;
 	int filter_id;
 	struct k_event stop_can_event;
+	struct k_mutex tx_lock;
+	struct k_sem tx_done;
 } can_context_t;
 
 static K_THREAD_STACK_ARRAY_DEFINE(rx_stack,
@@ -83,6 +85,16 @@ static void csp_can_rx_thread(void * arg1, void * arg2, void * arg3) {
 	}
 }
 
+static void csp_can_tx_done(const struct device * device, int error, void * user_data) {
+
+	can_context_t * ctx = user_data;
+
+	(void)device;
+	(void)error;
+
+	k_sem_give(&ctx->tx_done);
+}
+
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t *packet) {
 
 	int ret = CSP_ERR_NONE;
@@ -100,10 +112,19 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 	frame.flags = CAN_FRAME_IDE;
 	memcpy(frame.data, data, dlc);
 
-	ret = can_send(ctx->device, &frame, CSP_CAN_TX_TIME_OUT, NULL, NULL);
+	/* With no callback can_send() blocks until the frame is acknowledged, and
+	   its timeout only covers waiting for a mailbox. */
+	k_mutex_lock(&ctx->tx_lock, K_FOREVER);
+	k_sem_reset(&ctx->tx_done);
+
+	ret = can_send(ctx->device, &frame, CSP_CAN_TX_TIME_OUT, csp_can_tx_done, ctx);
 	if (ret < 0) {
 		LOG_ERR("[%s] can_send() failed, errno %d", ctx->name, ret);
+	} else if (k_sem_take(&ctx->tx_done, CSP_CAN_TX_TIME_OUT) < 0) {
+		LOG_ERR("[%s] frame 0x%08x was not sent", ctx->name, id);
+		ret = CSP_ERR_TIMEDOUT;
 	}
+	k_mutex_unlock(&ctx->tx_lock);
 
 end:
 	return ret;
@@ -190,6 +211,8 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 	ctx->device = device;
 	ctx->filter_id = -1;
 	k_event_init(&ctx->stop_can_event);
+	k_mutex_init(&ctx->tx_lock);
+	k_sem_init(&ctx->tx_done, 0, 1);
 
 	LOG_DBG("INIT %s: device: [%s], local address: %d, bitrate: %d: filter add: %d, filter mask: 0x%04x",
 			  ctx->name, device->name, address, bitrate, filter_addr, filter_mask);
