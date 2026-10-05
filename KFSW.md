@@ -7,6 +7,7 @@ Fork of `libcsp/libcsp`. K-FSW pins a revision of the `kfsw` branch in its
 | --- | --- | --- |
 | Stamp the source address on loopback sends | `src/csp_io.c` | not submitted |
 | Bound the wait for a CAN frame to be sent | `src/drivers/can/can_zephyr.c` | not submitted |
+| Zephyr option to leave the build date out of CMP ident | `zephyr/Kconfig`, `zephyr/CMakeLists.txt` | not submitted |
 
 `csp_send_direct()` short-circuits packets addressed to the local node straight
 to `csp_if_lo` without passing through `send_packet()`, which is what applies
@@ -19,6 +20,11 @@ the loopback send through `send_packet()` like every other interface.
 the frame was acknowledged while its timeout only covered waiting for a mailbox.
 A node alone on the bus held the calling thread indefinitely. The fix waits for a
 callback with the same timeout.
+
+`CSP_REPRODUCIBLE_BUILDS` exists upstream but the Zephyr module could not set
+it, so a CMP ident reply always carried the compile date of
+`csp_cmp_ident.c`. That file is rarely rebuilt, so the date said nothing about
+the running image. `CONFIG_CSP_REPRODUCIBLE_BUILDS` turns the option on.
 
 Rules for this fork:
 

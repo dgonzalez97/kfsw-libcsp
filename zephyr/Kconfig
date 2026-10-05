@@ -28,6 +28,12 @@ config CSP_USE_RTABLE
 	help
 	  This option enables to use the CSP static routing table
 
+config CSP_REPRODUCIBLE_BUILDS
+	bool "Leave the build date and time out of CMP ident"
+	help
+	  A CMP ident reply carries the date and time csp_cmp_ident.c was
+	  compiled, which is not when the image was built. Leave both empty.
+
 config CSP_ATOMIC_MUTEX_TIMEOUT
 	int "Waiting period to lock the mutex (msec) in atomic"
 	depends on ARMV6_M_ARMV8_M_BASELINE
