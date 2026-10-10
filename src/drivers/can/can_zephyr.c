@@ -30,6 +30,10 @@ typedef struct {
 	struct k_event stop_can_event;
 	struct k_mutex tx_lock;
 	struct k_sem tx_done;
+	/* What the controller reported for the last frame, from the callback. */
+	int tx_status;
+	/* A frame whose completion never arrived is still with the controller. */
+	bool tx_pending;
 } can_context_t;
 
 static K_THREAD_STACK_ARRAY_DEFINE(rx_stack,
@@ -90,8 +94,10 @@ static void csp_can_tx_done(const struct device * device, int error, void * user
 	can_context_t * ctx = user_data;
 
 	(void)device;
-	(void)error;
 
+	/* can_send() returning zero means queued, not sent. This is where the
+	   controller says what actually happened, so keep it. */
+	ctx->tx_status = error;
 	k_sem_give(&ctx->tx_done);
 }
 
@@ -115,14 +121,31 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 	/* With no callback can_send() blocks until the frame is acknowledged, and
 	   its timeout only covers waiting for a mailbox. */
 	k_mutex_lock(&ctx->tx_lock, K_FOREVER);
+
+	/* A frame that timed out may still be in the controller. Wait for its
+	   completion before sending another, so a late one cannot be mistaken
+	   for this frame's, and do not queue behind a frame nobody is acking. */
+	if (ctx->tx_pending) {
+		if (k_sem_take(&ctx->tx_done, CSP_CAN_TX_TIME_OUT) < 0) {
+			k_mutex_unlock(&ctx->tx_lock);
+			return CSP_ERR_TIMEDOUT;
+		}
+		ctx->tx_pending = false;
+	}
+
 	k_sem_reset(&ctx->tx_done);
+	ctx->tx_status = 0;
 
 	ret = can_send(ctx->device, &frame, CSP_CAN_TX_TIME_OUT, csp_can_tx_done, ctx);
 	if (ret < 0) {
 		LOG_ERR("[%s] can_send() failed, errno %d", ctx->name, ret);
 	} else if (k_sem_take(&ctx->tx_done, CSP_CAN_TX_TIME_OUT) < 0) {
 		LOG_ERR("[%s] frame 0x%08x was not sent", ctx->name, id);
+		ctx->tx_pending = true;
 		ret = CSP_ERR_TIMEDOUT;
+	} else if (ctx->tx_status != 0) {
+		LOG_ERR("[%s] frame 0x%08x failed, errno %d", ctx->name, id, ctx->tx_status);
+		ret = CSP_ERR_DRIVER;
 	}
 	k_mutex_unlock(&ctx->tx_lock);
 
