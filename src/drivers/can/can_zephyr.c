@@ -26,6 +26,7 @@ typedef struct {
 	struct k_msgq rx_msgq;
 	uint8_t rx_msgq_buf[CONFIG_CSP_CAN_RX_MSGQ_DEPTH * sizeof(struct can_frame)];
 	struct k_thread rx_thread;
+	size_t rx_stack_index;
 	int filter_id;
 	struct k_event stop_can_event;
 	struct k_mutex tx_lock;
@@ -38,7 +39,9 @@ typedef struct {
 
 static K_THREAD_STACK_ARRAY_DEFINE(rx_stack,
 			CONFIG_CSP_CAN_RX_THREAD_NUM, CONFIG_CSP_CAN_RX_THREAD_STACK_SIZE);
-static uint8_t rx_thread_idx = 0;
+/* Interface open/stop calls are serialized by the caller. Each live RX thread
+   keeps its own slot, including while a stop attempt has failed. */
+static bool rx_stack_used[CONFIG_CSP_CAN_RX_THREAD_NUM];
 
 static void csp_can_rx_thread(void * arg1, void * arg2, void * arg3) {
 
@@ -167,13 +170,14 @@ static int csp_can_finish_rx_thread(can_context_t * ctx) {
 
 	ret = k_thread_join(&ctx->rx_thread, CSP_CAN_RX_THREAD_JOIN_TIME_OUT);
 	if (ret < 0) {
-		LOG_WRN("[%s] Failed to finish the RX thread, but will continue the cleanup. error: %d",
+		LOG_WRN("[%s] Failed to finish the RX thread; resources retained. error: %d",
 			 ctx->name, ret);
+		return ret;
 	}
 
 	k_event_clear(&ctx->stop_can_event, CSP_CAN_STOP_EVENT);
 
-	rx_thread_idx--;
+	rx_stack_used[ctx->rx_stack_index] = false;
 
 	k_msgq_purge(&ctx->rx_msgq);
 	k_msgq_cleanup(&ctx->rx_msgq);
@@ -187,6 +191,7 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 				    csp_iface_t ** return_iface) {
 
 	int ret;
+	size_t rx_stack_index;
 	k_tid_t rx_tid;
 	can_context_t * ctx = NULL;
 	const char * name;
@@ -198,7 +203,12 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 
 	name = ifname ? ifname : device->name;
 
-	if (rx_thread_idx >= CONFIG_CSP_CAN_RX_THREAD_NUM) {
+	for (rx_stack_index = 0; rx_stack_index < CONFIG_CSP_CAN_RX_THREAD_NUM; rx_stack_index++) {
+		if (!rx_stack_used[rx_stack_index]) {
+			break;
+		}
+	}
+	if (rx_stack_index == CONFIG_CSP_CAN_RX_THREAD_NUM) {
 		LOG_ERR("[%s] No more RX thread can be created. (MAX: %d) Please check CONFIG_CSP_CAN_RX_THREAD_NUM.",
 			 name, CONFIG_CSP_CAN_RX_THREAD_NUM);
 		ret = CSP_ERR_DRIVER;
@@ -233,6 +243,7 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 	ctx->ifdata.pbufs = NULL;
 	ctx->device = device;
 	ctx->filter_id = -1;
+	ctx->rx_stack_index = rx_stack_index;
 	k_event_init(&ctx->stop_can_event);
 	k_mutex_init(&ctx->tx_lock);
 	k_sem_init(&ctx->tx_done, 0, 1);
@@ -266,8 +277,8 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 	}
 
 	/* Create receive thread */
-	rx_tid = k_thread_create(&ctx->rx_thread, rx_stack[rx_thread_idx],
-					 K_THREAD_STACK_SIZEOF(rx_stack[rx_thread_idx]),
+	rx_tid = k_thread_create(&ctx->rx_thread, rx_stack[rx_stack_index],
+					 K_THREAD_STACK_SIZEOF(rx_stack[rx_stack_index]),
 					 (k_thread_entry_t)csp_can_rx_thread,
 					 &ctx->rx_msgq, &ctx->iface, &ctx->stop_can_event,
 					 CONFIG_CSP_CAN_RX_THREAD_PRIORITY, 0, K_NO_WAIT);
@@ -276,7 +287,7 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 		ret = CSP_ERR_DRIVER;
 		goto cleanup_iface;
 	}
-	rx_thread_idx++;
+	rx_stack_used[rx_stack_index] = true;
 
 	/* Enable CAN */
 	ret = can_start(device);
@@ -293,14 +304,16 @@ int csp_can_open_and_add_interface(const struct device * device, const char * if
 
 	/*
 	 * The following section is for restoring acquired resources when
-	 * something fails. Unfortunately, we can't take any action if the
-	 * restoration process fails, so we proceed with the remaining
-	 * cleanup. In addition to this, we've chosen not to restore the
+	 * something fails. If the RX thread cannot finish, its interface remains
+	 * registered so the retained context can be stopped explicitly later.
+	 * In addition to this, we've chosen not to restore the
 	 * CAN bit rate. If this causes any issues, please open an issue
 	 * on GitHub.
 	 */
 cleanup_thread:
-	(void)csp_can_finish_rx_thread(ctx);
+	if (csp_can_finish_rx_thread(ctx) < 0) {
+		return ret;
+	}
 
 cleanup_iface:
 	(void)csp_can_remove_interface(&ctx->iface);
@@ -367,11 +380,24 @@ int csp_can_stop(csp_iface_t * iface) {
 	ctx = iface->driver_data;
 
 	ret = can_stop(ctx->device);
-	if (ret < 0) {
-		LOG_WRN("[%s] can_stop() failed, but will continue the cleannp. error: %d", iface->name, ret);
+	if ((ret < 0) && (ret != -EALREADY)) {
+		LOG_WRN("[%s] can_stop() failed; resources retained. error: %d", iface->name, ret);
+		return ret;
 	}
 
-	(void)csp_can_finish_rx_thread(ctx);
+	/* A timed-out send still owns its callback context. Some controllers do
+	   not deliver that callback synchronously when stopped. */
+	if (ctx->tx_pending) {
+		if (k_sem_take(&ctx->tx_done, CSP_CAN_TX_TIME_OUT) < 0) {
+			return CSP_ERR_TIMEDOUT;
+		}
+		ctx->tx_pending = false;
+	}
+
+	ret = csp_can_finish_rx_thread(ctx);
+	if (ret < 0) {
+		return ret;
+	}
 
 	(void)csp_can_remove_interface(&ctx->iface);
 

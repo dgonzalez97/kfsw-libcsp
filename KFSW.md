@@ -7,6 +7,7 @@ Fork of `libcsp/libcsp`. K-FSW pins a revision of the `kfsw` branch in its
 | --- | --- | --- |
 | Stamp the source address on loopback sends | `src/csp_io.c` | not submitted |
 | Bound the wait for a CAN frame to be sent | `src/drivers/can/can_zephyr.c` | not submitted |
+| Retain CAN resources until RX and pending TX callbacks finish | `src/drivers/can/can_zephyr.c`, `include/csp/drivers/can_zephyr.h` | not submitted |
 | Zephyr option to leave the build date out of CMP ident | `zephyr/Kconfig`, `zephyr/CMakeLists.txt` | not submitted |
 
 `csp_send_direct()` short-circuits packets addressed to the local node straight
@@ -20,6 +21,14 @@ the loopback send through `send_packet()` like every other interface.
 the frame was acknowledged while its timeout only covered waiting for a mailbox.
 A node alone on the bus held the calling thread indefinitely. The fix waits for a
 callback with the same timeout.
+
+CAN stop keeps its interface, context, queue and RX stack slot when controller
+stop, pending TX completion or RX join fails. The caller can retry stop; an
+already stopped controller does not prevent cleanup. RX stack slots belong to
+individual contexts, so stopping an earlier interface cannot release a later
+thread's stack. Failed startup rollback also retains resources if RX cannot
+join, leaving the interface discoverable for explicit stop. Lifecycle callers
+must serialize changes and quiesce other interface users before stopping.
 
 `CSP_REPRODUCIBLE_BUILDS` exists upstream but the Zephyr module could not set
 it, so a CMP ident reply always carried the compile date of
